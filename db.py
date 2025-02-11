@@ -29,7 +29,8 @@ class DatabaseHandler:
                 # Create tables
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS zkt_users (
-                        user_id VARCHAR(50) PRIMARY KEY,
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(50),
                         username VARCHAR(100)
                     );
 
