@@ -1,0 +1,3 @@
+pyzk==0.9
+python-dateutil>=2.8.2
+psycopg2-binary>=2.9.9
