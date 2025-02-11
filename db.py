@@ -28,27 +28,26 @@ class DatabaseHandler:
             with self.conn.cursor() as cur:
                 # Create tables
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
+                    CREATE TABLE IF NOT EXISTS zkt_users (
                         user_id VARCHAR(50) PRIMARY KEY,
                         username VARCHAR(100),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
 
-                    CREATE TABLE IF NOT EXISTS attendance (
+                    CREATE TABLE IF NOT EXISTS zkt_attendance (
                         id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50) REFERENCES users(user_id),
+                        user_id VARCHAR(50) REFERENCES zkt_users(user_id),
                         timestamp TIMESTAMP,
                         device_serial VARCHAR(50),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        CONSTRAINT unique_attendance_record UNIQUE (user_id, timestamp, device_serial)
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
 
-                    CREATE INDEX IF NOT EXISTS idx_attendance_user_id 
-                    ON attendance(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_user_id 
+                    ON zkt_attendance(user_id);
 
-                    CREATE INDEX IF NOT EXISTS idx_attendance_timestamp 
-                    ON attendance(timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
+                    ON zkt_attendance(timestamp);
                 """)
                 self.conn.commit()
                 self.logger.info("Database tables verified/created")
@@ -62,7 +61,7 @@ class DatabaseHandler:
         """Check if attendance table is empty"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM attendance")
+                cur.execute("SELECT COUNT(*) FROM zkt_attendance")
                 count = cur.fetchone()[0]
                 return count == 0
         except Exception as e:
@@ -78,7 +77,7 @@ class DatabaseHandler:
                 
                 # Upsert query
                 query = """
-                    INSERT INTO users (user_id, username)
+                    INSERT INTO zkt_users (user_id, username)
                     VALUES (%s, %s)
                     ON CONFLICT (user_id) 
                     DO UPDATE SET username = EXCLUDED.username, updated_at = CURRENT_TIMESTAMP
@@ -97,7 +96,7 @@ class DatabaseHandler:
         """Get the latest attendance timestamp"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT MAX(timestamp) FROM attendance")
+                cur.execute("SELECT MAX(timestamp) FROM zkt_attendance")
                 return cur.fetchone()[0]
         except Exception as e:
             self.logger.error(f"Error getting latest timestamp: {str(e)}")
@@ -107,7 +106,7 @@ class DatabaseHandler:
         """Get total number of attendance records in database"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM attendance")
+                cur.execute("SELECT COUNT(*) FROM zkt_attendance")
                 return cur.fetchone()[0]
         except Exception as e:
             self.logger.error(f"Error getting attendance count: {str(e)}")
@@ -117,7 +116,7 @@ class DatabaseHandler:
         """Clear all records from attendance table"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("TRUNCATE TABLE attendance")
+                cur.execute("TRUNCATE TABLE zkt_attendance")
                 self.conn.commit()
                 self.logger.info("Cleared attendance table")
                 return True
@@ -132,24 +131,13 @@ class DatabaseHandler:
             with self.conn.cursor() as cur:
                 success_count = 0
                 for record in records:
-                    try:
-                        # First try to insert
-                        insert_query = """
-                            INSERT INTO attendance (user_id, timestamp, device_serial)
-                            VALUES (%s, %s, %s)
-                        """
-                        cur.execute(insert_query, (record['user_id'], record['timestamp'], device_serial))
-                        success_count += 1
-                    except psycopg2.IntegrityError:
-                        # If record exists, update it
-                        self.conn.rollback()  # Reset the transaction
-                        update_query = """
-                            UPDATE attendance 
-                            SET created_at = CURRENT_TIMESTAMP
-                            WHERE user_id = %s AND timestamp = %s AND device_serial = %s
-                        """
-                        cur.execute(update_query, (record['user_id'], record['timestamp'], device_serial))
-                        success_count += 1
+                    # Simple insert without checking for duplicates
+                    insert_query = """
+                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
+                        VALUES (%s, %s, %s)
+                    """
+                    cur.execute(insert_query, (record['user_id'], record['timestamp'], device_serial))
+                    success_count += 1
                     
                     # Debug logging
                     self.logger.debug(
@@ -174,7 +162,7 @@ class DatabaseHandler:
             
             # Clear and reinsert all records for this device
             with self.conn.cursor() as cur:
-                cur.execute("DELETE FROM attendance WHERE device_serial = %s", (device_serial,))
+                cur.execute("DELETE FROM zkt_attendance WHERE device_serial = %s", (device_serial,))
                 
                 # Batch insert all records
                 attendance_data = [
@@ -183,7 +171,7 @@ class DatabaseHandler:
                 ]
                 
                 execute_batch(cur, """
-                    INSERT INTO attendance (user_id, timestamp, device_serial)
+                    INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
                     VALUES (%s, %s, %s)
                 """, attendance_data)
                 

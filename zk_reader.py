@@ -244,11 +244,16 @@ def main():
     # Initialize database
     db_handler = DatabaseHandler()
     if not db_handler.connect():
+        print("Failed to connect to database")
         return
 
     try:
         # Ensure database tables exist
-        db_handler.ensure_tables()
+        if not db_handler.ensure_tables():
+            print("Failed to create database tables")
+            return
+            
+        print("Database tables verified successfully")
 
         readers = []
         # Initialize all devices
