@@ -23,38 +23,45 @@ class DatabaseHandler:
             self.logger.info("Database connection closed")
 
     def ensure_tables(self):
-        """Create tables if they don't exist"""
+        """Check if tables exist without recreating"""
         try:
             with self.conn.cursor() as cur:
-                # Drop existing tables if they exist
+                # Check if tables exist
                 cur.execute("""
-                    DROP TABLE IF EXISTS zkt_attendance;
-                    DROP TABLE IF EXISTS zkt_users;
-                    
-                    CREATE TABLE IF NOT EXISTS zkt_users (
-                        id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50) UNIQUE,
-                        username VARCHAR(100)
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'zkt_users'
                     );
-
-                    CREATE TABLE IF NOT EXISTS zkt_attendance (
-                        id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50),
-                        timestamp TIMESTAMP,
-                        device_serial VARCHAR(50),
-                        CONSTRAINT uq_attendance UNIQUE (user_id, timestamp, device_serial),
-                        CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES zkt_users(user_id)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
-                    ON zkt_attendance(timestamp);
                 """)
-                self.conn.commit()
-                self.logger.info("Database tables recreated")
+                users_exists = cur.fetchone()[0]
+                
+                if not users_exists:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS zkt_users (
+                            id SERIAL PRIMARY KEY,
+                            user_id VARCHAR(50) UNIQUE,
+                            username VARCHAR(100)
+                        );
+
+                        CREATE TABLE IF NOT EXISTS zkt_attendance (
+                            id SERIAL PRIMARY KEY,
+                            user_id VARCHAR(50),
+                            timestamp TIMESTAMP,
+                            device_serial VARCHAR(50),
+                            CONSTRAINT uq_attendance UNIQUE (user_id, timestamp, device_serial),
+                            CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES zkt_users(user_id)
+                        );
+
+                        CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
+                        ON zkt_attendance(timestamp);
+                    """)
+                    self.conn.commit()
+                    self.logger.info("Created new database tables")
                 return True
         except Exception as e:
-            self.logger.error(f"Error ensuring tables: {str(e)}")
-            self.conn.rollback()
+            self.logger.error(f"Error checking/creating tables: {str(e)}")
+            if self.conn:
+                self.conn.rollback()
             return False
 
     def is_attendance_empty(self):
@@ -161,34 +168,47 @@ class DatabaseHandler:
             return False
 
     def save_attendance(self, records, device_serial):
-        """Save attendance records to database after ensuring users exist"""
+        """Save attendance records to database with better error handling"""
         try:
+            if not records:
+                return True
+
             # First ensure all users exist
-            unique_users = [
-                {'user_id': record['user_id'], 'name': f"User {record['user_id']}"}
+            unique_users = list({
+                record['user_id']: {
+                    'user_id': record['user_id'],
+                    'name': f"User {record['user_id']}"
+                }
                 for record in records
-            ]
+            }.values())
+
             if not self.ensure_users_exist(unique_users):
                 return False
 
-            # Then save attendance records
+            # Then save attendance records in smaller batches
             with self.conn.cursor() as cur:
-                attendance_data = [
-                    (record['user_id'], record['timestamp'], device_serial)
-                    for record in records
-                ]
-                
-                execute_batch(cur, """
-                    INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
-                """, attendance_data)
-                
-                self.conn.commit()
-                return True
+                batch_size = 100
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    attendance_data = [
+                        (record['user_id'], record['timestamp'], device_serial)
+                        for record in batch
+                    ]
+                    
+                    execute_batch(cur, """
+                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
+                    """, attendance_data)
+                    
+                    self.conn.commit()
+                    
+            return True
+            
         except Exception as e:
             self.logger.error(f"Error saving attendance: {str(e)}")
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             return False
 
     def sync_device_records(self, records, device_serial):

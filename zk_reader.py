@@ -20,14 +20,20 @@ class ZKTecoReader:
         self.logger = logging.getLogger(__name__)
 
     def connect(self):
-        """Establish connection with the device"""
-        try:
-            self.conn = self.zk.connect()
-            self.logger.info(f"Successfully connected to device at {self.ip}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to connect to device: {str(e)}")
-            return False
+        """Establish connection with the device with retry"""
+        retry_count = 3
+        while retry_count > 0:
+            try:
+                self.conn = self.zk.connect()
+                self.logger.info(f"Successfully connected to device at {self.ip}")
+                return True
+            except Exception as e:
+                retry_count -= 1
+                self.logger.error(f"Connection attempt failed: {str(e)}")
+                if retry_count > 0:
+                    time.sleep(5)  # Wait 5 seconds before retry
+                self.disconnect()  # Ensure clean disconnect before retry
+        return False
 
     def disconnect(self):
         """Safely disconnect from the device"""
@@ -36,29 +42,34 @@ class ZKTecoReader:
             self.logger.info("Disconnected from device")
 
     def get_attendance_logs(self):
-        """Retrieve attendance logs from the device"""
-        try:
-            if not self.conn:
-                raise Exception("Device not connected")
+        """Retrieve attendance logs from the device with retry"""
+        if not self.conn:
+            if not self.connect():
+                return []
 
-            # Get attendance
+        try:
             attendance = self.conn.get_attendance()
+            if not attendance:
+                return []
+                
             logs = []
-            
             for record in attendance:
-                log = {
-                    'user_id': record.user_id,
-                    'timestamp': record.timestamp,
-                    'punch': record.punch,
-                    'status': record.status,
-                }
-                logs.append(log)
-            
-            self.logger.info(f"Successfully retrieved {len(logs)} attendance records")
+                try:
+                    log = {
+                        'user_id': str(record.user_id),  # Convert to string
+                        'timestamp': record.timestamp,
+                        'punch': getattr(record, 'punch', None),
+                        'status': getattr(record, 'status', None),
+                    }
+                    logs.append(log)
+                except AttributeError:
+                    continue  # Skip invalid records
+                    
             return logs
 
         except Exception as e:
             self.logger.error(f"Error getting attendance logs: {str(e)}")
+            self.disconnect()  # Force disconnect on error
             return []
 
     def get_users(self):
@@ -189,52 +200,50 @@ class ZKTecoReader:
 
     def monitor_attendance_with_db(self, db_handler):
         """Monitor attendance and save to database"""
-        try:
-            if not self.conn:
-                raise Exception("Device not connected")
+        while True:  # Keep trying to monitor
+            try:
+                if not self.conn and not self.connect():
+                    self.logger.error("Failed to connect to device, retrying in 30 seconds...")
+                    time.sleep(30)
+                    continue
 
-            device_info = self.get_device_info()
-            device_serial = device_info['serial'] if device_info else self.ip
-            
-            print(f"\nMonitoring device: {self.ip} (Serial: {device_serial})")
-            
-            # Initial sync of users
-            users = self.get_users()
-            if not db_handler.ensure_users_exist(users):
-                raise Exception("Failed to sync users")
-            
-            # Only load initial data if device has no records
-            if not db_handler.has_device_records(device_serial):
-                self.logger.info(f"No existing records found for device {device_serial}. Loading initial data...")
-                current_records = self.get_attendance_logs()
-                if current_records:
-                    if db_handler.save_attendance(current_records, device_serial):
-                        self.logger.info(f"Loaded {len(current_records)} initial records")
-            else:
-                self.logger.info(f"Device {device_serial} already has records in database")
-            
-            # Continue with real-time monitoring
-            while True:
-                latest_device_time = db_handler.get_latest_device_timestamp(device_serial)
-                current_records = self.get_attendance_logs()
+                device_info = self.get_device_info()
+                device_serial = device_info['serial'] if device_info else self.ip
                 
-                if current_records:
-                    # Filter only new records
-                    new_records = [
-                        record for record in current_records
-                        if latest_device_time is None or record['timestamp'] > latest_device_time
-                    ]
+                # Initial sync of users and check for existing records
+                users = self.get_users()
+                if users:
+                    db_handler.ensure_users_exist(users)
+                
+                if not db_handler.has_device_records(device_serial):
+                    self.logger.info(f"Loading initial data for device {device_serial}")
+                    current_records = self.get_attendance_logs()
+                    if current_records:
+                        db_handler.save_attendance(current_records, device_serial)
+                
+                # Monitoring loop
+                while True:
+                    time.sleep(5)  # Reduced polling frequency
                     
-                    if new_records:
-                        if db_handler.save_attendance(new_records, device_serial):
-                            self.logger.info(f"Saved {len(new_records)} new records")
-                            for record in new_records:
-                                print(f"\nNew attendance: User {record['user_id']} at {record['timestamp']}")
-                
-                time.sleep(2)
+                    if not self.conn:
+                        raise Exception("Device connection lost")
+                        
+                    latest_device_time = db_handler.get_latest_device_timestamp(device_serial)
+                    current_records = self.get_attendance_logs()
+                    
+                    if current_records:
+                        new_records = [
+                            record for record in current_records
+                            if latest_device_time is None or record['timestamp'] > latest_device_time
+                        ]
+                        
+                        if new_records:
+                            db_handler.save_attendance(new_records, device_serial)
 
-        except Exception as e:
-            self.logger.error(f"Error monitoring attendance: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"Monitoring error: {str(e)}")
+                self.disconnect()
+                time.sleep(30)  # Wait before reconnecting
 
 def main():
     # Initialize database
