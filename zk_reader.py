@@ -202,38 +202,35 @@ class ZKTecoReader:
             users = self.get_users()
             db_handler.sync_users(users)
             
+            # Only load initial data if device has no records
+            if not db_handler.has_device_records(device_serial):
+                self.logger.info(f"No existing records found for device {device_serial}. Loading initial data...")
+                current_records = self.get_attendance_logs()
+                if current_records:
+                    db_handler.save_attendance(current_records, device_serial)
+                    self.logger.info(f"Loaded {len(current_records)} initial records")
+            else:
+                self.logger.info(f"Device {device_serial} already has records in database")
+            
             # Track last sync time
             last_full_sync = datetime.now()
             SYNC_INTERVAL = 30 * 60  # 30 minutes in seconds
             
             while True:
+                latest_device_time = db_handler.get_latest_device_timestamp(device_serial)
                 current_records = self.get_attendance_logs()
-                if current_records:
-                    # Check for full sync every 30 minutes
-                    if (datetime.now() - last_full_sync).seconds >= SYNC_INTERVAL:
-                        db_count = db_handler.get_attendance_count()
-                        device_count = len(current_records)
-                        
-                        self.logger.info(f"Periodic check - DB records: {db_count}, Device records: {device_count}")
-                        
-                        if db_count < device_count:
-                            self.logger.info(f"Database missing records. Performing full sync...")
-                            if db_handler.sync_device_records(current_records, device_serial):
-                                self.logger.info("Full sync completed successfully")
-                        
-                        last_full_sync = datetime.now()
-                    
-                    # Real-time monitoring
-                    latest_db_timestamp = db_handler.get_latest_attendance_timestamp()
-                    new_records = [
-                        record for record in current_records
-                        if latest_db_timestamp is None or record['timestamp'] > latest_db_timestamp
-                    ]
-                    
-                    if new_records:
+                
+                # Filter only new records
+                new_records = [
+                    record for record in current_records
+                    if latest_device_time is None or record['timestamp'] > latest_device_time
+                ]
+                
+                if new_records:
+                    if db_handler.save_attendance(new_records, device_serial):
+                        self.logger.info(f"Saved {len(new_records)} new records")
                         for record in new_records:
-                            if db_handler.save_attendance([record], device_serial):
-                                print(f"\nNew attendance: User {record['user_id']} at {record['timestamp']}")
+                            print(f"\nNew attendance: User {record['user_id']} at {record['timestamp']}")
                 
                 time.sleep(2)
 
@@ -266,16 +263,7 @@ def main():
             print("No devices connected!")
             return
 
-        # Initial sync of attendance data
-        print("Performing initial sync of attendance data...")
-        for reader in readers:
-            device_info = reader.get_device_info()
-            device_serial = device_info['serial'] if device_info else reader.ip
-            logs = reader.get_attendance_logs()
-            if logs:
-                db_handler.save_attendance(logs, device_serial)
-
-        # Monitor all devices
+        # Start monitoring threads for all devices
         import threading
         threads = []
         for reader in readers:

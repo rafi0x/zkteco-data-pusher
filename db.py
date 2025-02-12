@@ -26,29 +26,31 @@ class DatabaseHandler:
         """Create tables if they don't exist"""
         try:
             with self.conn.cursor() as cur:
-                # Create tables
+                # Drop existing tables if they exist
                 cur.execute("""
+                    DROP TABLE IF EXISTS zkt_attendance;
+                    DROP TABLE IF EXISTS zkt_users;
+                    
                     CREATE TABLE IF NOT EXISTS zkt_users (
                         id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50),
+                        user_id VARCHAR(50) UNIQUE,
                         username VARCHAR(100)
                     );
 
                     CREATE TABLE IF NOT EXISTS zkt_attendance (
                         id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50) REFERENCES zkt_users(user_id),
+                        user_id VARCHAR(50),
                         timestamp TIMESTAMP,
-                        device_serial VARCHAR(50)
+                        device_serial VARCHAR(50),
+                        CONSTRAINT uq_attendance UNIQUE (user_id, timestamp, device_serial),
+                        CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES zkt_users(user_id)
                     );
-
-                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_user_id 
-                    ON zkt_attendance(user_id);
 
                     CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
                     ON zkt_attendance(timestamp);
                 """)
                 self.conn.commit()
-                self.logger.info("Database tables verified/created")
+                self.logger.info("Database tables recreated")
                 return True
         except Exception as e:
             self.logger.error(f"Error ensuring tables: {str(e)}")
@@ -123,43 +125,48 @@ class DatabaseHandler:
             self.conn.rollback()
             return False
 
+    def get_last_attendance_id(self):
+        """Get the last attendance ID"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT MAX(id) FROM zkt_attendance")
+                result = cur.fetchone()[0]
+                return result if result is not None else 0
+        except Exception as e:
+            self.logger.error(f"Error getting last attendance ID: {str(e)}")
+            return 0
+
     def save_attendance(self, records, device_serial):
         """Save attendance records to database"""
         try:
             with self.conn.cursor() as cur:
                 success_count = 0
-                for record in records:
-                    # Simple insert without checking for duplicates
-                    insert_query = """
-                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
-                        VALUES (%s, %s, %s)
-                    """
-                    cur.execute(insert_query, (record['user_id'], record['timestamp'], device_serial))
-                    success_count += 1
-                    
-                    # Debug logging
-                    self.logger.debug(
-                        f"Processed record - User: {record['user_id']}, "
-                        f"Time: {record['timestamp']}, Device: {device_serial}"
-                    )
-
+                # Batch insert records with ON CONFLICT DO NOTHING
+                attendance_data = [
+                    (record['user_id'], record['timestamp'], device_serial)
+                    for record in records
+                ]
+                
+                execute_batch(cur, """
+                    INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
+                """, attendance_data)
+                
                 self.conn.commit()
-                if success_count > 0:
-                    self.logger.info(f"Successfully saved {success_count} new attendance records")
-                return success_count > 0
+                return True
         except Exception as e:
             self.logger.error(f"Error saving attendance: {str(e)}")
             self.conn.rollback()
             return False
 
     def sync_device_records(self, records, device_serial):
-        """Full sync of device records"""
+        """Full sync of device records continuing from last ID"""
         try:
-            # First get count before sync
-            old_count = self.get_attendance_count()
+            last_id = self.get_last_attendance_id()
             
-            # Clear and reinsert all records for this device
             with self.conn.cursor() as cur:
+                # Clear only records for this device
                 cur.execute("DELETE FROM zkt_attendance WHERE device_serial = %s", (device_serial,))
                 
                 # Batch insert all records
@@ -171,13 +178,40 @@ class DatabaseHandler:
                 execute_batch(cur, """
                     INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
                     VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
                 """, attendance_data)
                 
                 self.conn.commit()
-                new_count = self.get_attendance_count()
-                self.logger.info(f"Full sync completed. Records: {old_count} -> {new_count}")
                 return True
         except Exception as e:
             self.logger.error(f"Error during full sync: {str(e)}")
             self.conn.rollback()
             return False
+
+    def has_device_records(self, device_serial):
+        """Check if device already has records in database"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM zkt_attendance 
+                        WHERE device_serial = %s
+                    )
+                """, (device_serial,))
+                return cur.fetchone()[0]
+        except Exception as e:
+            self.logger.error(f"Error checking device records: {str(e)}")
+            return False
+
+    def get_latest_device_timestamp(self, device_serial):
+        """Get latest timestamp for specific device"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT MAX(timestamp) FROM zkt_attendance 
+                    WHERE device_serial = %s
+                """, (device_serial,))
+                return cur.fetchone()[0]
+        except Exception as e:
+            self.logger.error(f"Error getting device timestamp: {str(e)}")
+            return None
