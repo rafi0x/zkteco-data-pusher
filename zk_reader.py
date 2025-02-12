@@ -119,23 +119,34 @@ class ZKTecoReader:
             self.logger.error(f"Error clearing attendance: {str(e)}")
             return False
 
-    def enable_realtime(self):
-        """Enable realtime event monitoring"""
+    def enable_realtime(self, db_handler, device_serial):
+        """Enable realtime event monitoring with database integration"""
         try:
             if not self.conn:
                 raise Exception("Device not connected")
             
             def attendance_handler(event):
-                self.logger.info("=== Real-time Attendance Event ===")
-                self.logger.info(f"User ID: {event.uid}")
-                self.logger.info(f"Status: {event.status}")
-                self.logger.info(f"Timestamp: {event.timestamp}")
-                self.logger.info("================================")
+                try:
+                    # Create attendance record from event
+                    record = {
+                        'user_id': str(event.uid),
+                        'timestamp': event.timestamp,
+                        'punch': event.punch,
+                        'status': event.status
+                    }
+                    
+                    # Save to database
+                    if db_handler.save_attendance([record], device_serial):
+                        self.logger.info(f"Real-time attendance saved - User: {record['user_id']}, Time: {record['timestamp']}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error handling real-time event: {str(e)}")
 
             self.logger.info("Enabling realtime monitoring...")
             self.conn.enable_device()
             self.conn.set_attendance_callback(attendance_handler)
             return True
+            
         except Exception as e:
             self.logger.error(f"Error enabling realtime events: {str(e)}")
             return False
@@ -210,35 +221,30 @@ class ZKTecoReader:
                 device_info = self.get_device_info()
                 device_serial = device_info['serial'] if device_info else self.ip
                 
-                # Initial sync of users and check for existing records
+                # Initial sync of users
                 users = self.get_users()
                 if users:
                     db_handler.ensure_users_exist(users)
                 
+                # Load initial data if needed
                 if not db_handler.has_device_records(device_serial):
                     self.logger.info(f"Loading initial data for device {device_serial}")
                     current_records = self.get_attendance_logs()
                     if current_records:
                         db_handler.save_attendance(current_records, device_serial)
                 
-                # Monitoring loop
+                # Enable real-time monitoring
+                if not self.enable_realtime(db_handler, device_serial):
+                    raise Exception("Failed to enable real-time monitoring")
+                
+                self.logger.info("Waiting for real-time attendance events...")
+                
+                # Keep the connection alive
                 while True:
-                    time.sleep(5)  # Reduced polling frequency
-                    
                     if not self.conn:
                         raise Exception("Device connection lost")
-                        
-                    latest_device_time = db_handler.get_latest_device_timestamp(device_serial)
-                    current_records = self.get_attendance_logs()
-                    
-                    if current_records:
-                        new_records = [
-                            record for record in current_records
-                            if latest_device_time is None or record['timestamp'] > latest_device_time
-                        ]
-                        
-                        if new_records:
-                            db_handler.save_attendance(new_records, device_serial)
+                    time.sleep(5)
+                    self.conn.refresh_data()
 
             except Exception as e:
                 self.logger.error(f"Monitoring error: {str(e)}")
@@ -277,13 +283,15 @@ def main():
         for reader in readers:
             thread = threading.Thread(
                 target=reader.monitor_attendance_with_db,
-                args=(db_handler,)
+                args=(db_handler,),
+                daemon=True
             )
-            thread.daemon = True
             thread.start()
             threads.append(thread)
 
         print("\nMonitoring all devices. Press Ctrl+C to exit.")
+        
+        # Keep main thread alive and handle Ctrl+C
         while True:
             time.sleep(1)
 
