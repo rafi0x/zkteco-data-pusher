@@ -200,37 +200,36 @@ class ZKTecoReader:
             
             # Initial sync of users
             users = self.get_users()
-            db_handler.sync_users(users)
+            if not db_handler.ensure_users_exist(users):
+                raise Exception("Failed to sync users")
             
             # Only load initial data if device has no records
             if not db_handler.has_device_records(device_serial):
                 self.logger.info(f"No existing records found for device {device_serial}. Loading initial data...")
                 current_records = self.get_attendance_logs()
                 if current_records:
-                    db_handler.save_attendance(current_records, device_serial)
-                    self.logger.info(f"Loaded {len(current_records)} initial records")
+                    if db_handler.save_attendance(current_records, device_serial):
+                        self.logger.info(f"Loaded {len(current_records)} initial records")
             else:
                 self.logger.info(f"Device {device_serial} already has records in database")
             
-            # Track last sync time
-            last_full_sync = datetime.now()
-            SYNC_INTERVAL = 30 * 60  # 30 minutes in seconds
-            
+            # Continue with real-time monitoring
             while True:
                 latest_device_time = db_handler.get_latest_device_timestamp(device_serial)
                 current_records = self.get_attendance_logs()
                 
-                # Filter only new records
-                new_records = [
-                    record for record in current_records
-                    if latest_device_time is None or record['timestamp'] > latest_device_time
-                ]
-                
-                if new_records:
-                    if db_handler.save_attendance(new_records, device_serial):
-                        self.logger.info(f"Saved {len(new_records)} new records")
-                        for record in new_records:
-                            print(f"\nNew attendance: User {record['user_id']} at {record['timestamp']}")
+                if current_records:
+                    # Filter only new records
+                    new_records = [
+                        record for record in current_records
+                        if latest_device_time is None or record['timestamp'] > latest_device_time
+                    ]
+                    
+                    if new_records:
+                        if db_handler.save_attendance(new_records, device_serial):
+                            self.logger.info(f"Saved {len(new_records)} new records")
+                            for record in new_records:
+                                print(f"\nNew attendance: User {record['user_id']} at {record['timestamp']}")
                 
                 time.sleep(2)
 

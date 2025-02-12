@@ -136,12 +136,43 @@ class DatabaseHandler:
             self.logger.error(f"Error getting last attendance ID: {str(e)}")
             return 0
 
-    def save_attendance(self, records, device_serial):
-        """Save attendance records to database"""
+    def ensure_users_exist(self, users):
+        """Ensure all users exist in database before adding attendance"""
         try:
             with self.conn.cursor() as cur:
-                success_count = 0
-                # Batch insert records with ON CONFLICT DO NOTHING
+                # Create list of unique user IDs
+                user_ids = [(user['user_id'], user.get('name', 'Unknown'))
+                          for user in users]
+                
+                # Batch insert/update users
+                execute_batch(cur, """
+                    INSERT INTO zkt_users (user_id, username)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE 
+                    SET username = EXCLUDED.username
+                """, user_ids)
+                
+                self.conn.commit()
+                self.logger.info(f"Ensured {len(user_ids)} users exist in database")
+                return True
+        except Exception as e:
+            self.logger.error(f"Error ensuring users exist: {str(e)}")
+            self.conn.rollback()
+            return False
+
+    def save_attendance(self, records, device_serial):
+        """Save attendance records to database after ensuring users exist"""
+        try:
+            # First ensure all users exist
+            unique_users = [
+                {'user_id': record['user_id'], 'name': f"User {record['user_id']}"}
+                for record in records
+            ]
+            if not self.ensure_users_exist(unique_users):
+                return False
+
+            # Then save attendance records
+            with self.conn.cursor() as cur:
                 attendance_data = [
                     (record['user_id'], record['timestamp'], device_serial)
                     for record in records
@@ -161,9 +192,15 @@ class DatabaseHandler:
             return False
 
     def sync_device_records(self, records, device_serial):
-        """Full sync of device records continuing from last ID"""
+        """Full sync of device records after ensuring users exist"""
         try:
-            last_id = self.get_last_attendance_id()
+            # First ensure all users exist
+            unique_users = [
+                {'user_id': record['user_id'], 'name': f"User {record['user_id']}"}
+                for record in records
+            ]
+            if not self.ensure_users_exist(unique_users):
+                return False
             
             with self.conn.cursor() as cur:
                 # Clear only records for this device
