@@ -23,45 +23,36 @@ class DatabaseHandler:
             self.logger.info("Database connection closed")
 
     def ensure_tables(self):
-        """Check if tables exist without recreating"""
+        """Create tables if they don't exist"""
         try:
             with self.conn.cursor() as cur:
-                # Check if tables exist
+                # Create tables
                 cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'zkt_users'
+                    CREATE TABLE IF NOT EXISTS zkt_users (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(50),
+                        username VARCHAR(100)
                     );
+
+                    CREATE TABLE IF NOT EXISTS zkt_attendance (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(50) REFERENCES zkt_users(user_id),
+                        timestamp TIMESTAMP,
+                        device_serial VARCHAR(50)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_user_id 
+                    ON zkt_attendance(user_id);
+
+                    CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
+                    ON zkt_attendance(timestamp);
                 """)
-                users_exists = cur.fetchone()[0]
-                
-                if not users_exists:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS zkt_users (
-                            id SERIAL PRIMARY KEY,
-                            user_id VARCHAR(50) UNIQUE,
-                            username VARCHAR(100)
-                        );
-
-                        CREATE TABLE IF NOT EXISTS zkt_attendance (
-                            id SERIAL PRIMARY KEY,
-                            user_id VARCHAR(50),
-                            timestamp TIMESTAMP,
-                            device_serial VARCHAR(50),
-                            CONSTRAINT uq_attendance UNIQUE (user_id, timestamp, device_serial),
-                            CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES zkt_users(user_id)
-                        );
-
-                        CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
-                        ON zkt_attendance(timestamp);
-                    """)
-                    self.conn.commit()
-                    self.logger.info("Created new database tables")
+                self.conn.commit()
+                self.logger.info("Database tables verified/created")
                 return True
         except Exception as e:
-            self.logger.error(f"Error checking/creating tables: {str(e)}")
-            if self.conn:
-                self.conn.rollback()
+            self.logger.error(f"Error ensuring tables: {str(e)}")
+            self.conn.rollback()
             return False
 
     def is_attendance_empty(self):
@@ -132,98 +123,43 @@ class DatabaseHandler:
             self.conn.rollback()
             return False
 
-    def get_last_attendance_id(self):
-        """Get the last attendance ID"""
+    def save_attendance(self, records, device_serial):
+        """Save attendance records to database"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT MAX(id) FROM zkt_attendance")
-                result = cur.fetchone()[0]
-                return result if result is not None else 0
-        except Exception as e:
-            self.logger.error(f"Error getting last attendance ID: {str(e)}")
-            return 0
+                success_count = 0
+                for record in records:
+                    # Simple insert without checking for duplicates
+                    insert_query = """
+                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
+                        VALUES (%s, %s, %s)
+                    """
+                    cur.execute(insert_query, (record['user_id'], record['timestamp'], device_serial))
+                    success_count += 1
+                    
+                    # Debug logging
+                    self.logger.debug(
+                        f"Processed record - User: {record['user_id']}, "
+                        f"Time: {record['timestamp']}, Device: {device_serial}"
+                    )
 
-    def ensure_users_exist(self, users):
-        """Ensure all users exist in database before adding attendance"""
-        try:
-            with self.conn.cursor() as cur:
-                # Create list of unique user IDs
-                user_ids = [(user['user_id'], user.get('name', 'Unknown'))
-                          for user in users]
-                
-                # Batch insert/update users
-                execute_batch(cur, """
-                    INSERT INTO zkt_users (user_id, username)
-                    VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO UPDATE 
-                    SET username = EXCLUDED.username
-                """, user_ids)
-                
                 self.conn.commit()
-                self.logger.info(f"Ensured {len(user_ids)} users exist in database")
-                return True
+                if success_count > 0:
+                    self.logger.info(f"Successfully saved {success_count} new attendance records")
+                return success_count > 0
         except Exception as e:
-            self.logger.error(f"Error ensuring users exist: {str(e)}")
+            self.logger.error(f"Error saving attendance: {str(e)}")
             self.conn.rollback()
             return False
 
-    def save_attendance(self, records, device_serial):
-        """Save attendance records to database with better error handling"""
-        try:
-            if not records:
-                return True
-
-            # First ensure all users exist
-            unique_users = list({
-                record['user_id']: {
-                    'user_id': record['user_id'],
-                    'name': f"User {record['user_id']}"
-                }
-                for record in records
-            }.values())
-
-            if not self.ensure_users_exist(unique_users):
-                return False
-
-            # Then save attendance records in smaller batches
-            with self.conn.cursor() as cur:
-                batch_size = 100
-                for i in range(0, len(records), batch_size):
-                    batch = records[i:i + batch_size]
-                    attendance_data = [
-                        (record['user_id'], record['timestamp'], device_serial)
-                        for record in batch
-                    ]
-                    
-                    execute_batch(cur, """
-                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
-                    """, attendance_data)
-                    
-                    self.conn.commit()
-                    
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error saving attendance: {str(e)}")
-            if self.conn:
-                self.conn.rollback()
-            return False
-
     def sync_device_records(self, records, device_serial):
-        """Full sync of device records after ensuring users exist"""
+        """Full sync of device records"""
         try:
-            # First ensure all users exist
-            unique_users = [
-                {'user_id': record['user_id'], 'name': f"User {record['user_id']}"}
-                for record in records
-            ]
-            if not self.ensure_users_exist(unique_users):
-                return False
+            # First get count before sync
+            old_count = self.get_attendance_count()
             
+            # Clear and reinsert all records for this device
             with self.conn.cursor() as cur:
-                # Clear only records for this device
                 cur.execute("DELETE FROM zkt_attendance WHERE device_serial = %s", (device_serial,))
                 
                 # Batch insert all records
@@ -235,40 +171,13 @@ class DatabaseHandler:
                 execute_batch(cur, """
                     INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
                     VALUES (%s, %s, %s)
-                    ON CONFLICT (user_id, timestamp, device_serial) DO NOTHING
                 """, attendance_data)
                 
                 self.conn.commit()
+                new_count = self.get_attendance_count()
+                self.logger.info(f"Full sync completed. Records: {old_count} -> {new_count}")
                 return True
         except Exception as e:
             self.logger.error(f"Error during full sync: {str(e)}")
             self.conn.rollback()
             return False
-
-    def has_device_records(self, device_serial):
-        """Check if device already has records in database"""
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT 1 FROM zkt_attendance 
-                        WHERE device_serial = %s
-                    )
-                """, (device_serial,))
-                return cur.fetchone()[0]
-        except Exception as e:
-            self.logger.error(f"Error checking device records: {str(e)}")
-            return False
-
-    def get_latest_device_timestamp(self, device_serial):
-        """Get latest timestamp for specific device"""
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                    SELECT MAX(timestamp) FROM zkt_attendance 
-                    WHERE device_serial = %s
-                """, (device_serial,))
-                return cur.fetchone()[0]
-        except Exception as e:
-            self.logger.error(f"Error getting device timestamp: {str(e)}")
-            return None
