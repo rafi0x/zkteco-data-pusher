@@ -26,29 +26,28 @@ class DatabaseHandler:
         """Create tables if they don't exist"""
         try:
             with self.conn.cursor() as cur:
-                # Create tables
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS zkt_users (
                         id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50),
+                        user_id VARCHAR(50) UNIQUE,
                         username VARCHAR(100)
                     );
 
                     CREATE TABLE IF NOT EXISTS zkt_attendance (
                         id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(50) REFERENCES zkt_users(user_id),
+                        user_id VARCHAR(50),
                         timestamp TIMESTAMP,
-                        device_serial VARCHAR(50)
+                        device_serial VARCHAR(50),
+                        UNIQUE (user_id, timestamp, device_serial)
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_zkt_attendance_user_id 
                     ON zkt_attendance(user_id);
-
+                    
                     CREATE INDEX IF NOT EXISTS idx_zkt_attendance_timestamp 
                     ON zkt_attendance(timestamp);
                 """)
                 self.conn.commit()
-                self.logger.info("Database tables verified/created")
                 return True
         except Exception as e:
             self.logger.error(f"Error ensuring tables: {str(e)}")
@@ -73,15 +72,21 @@ class DatabaseHandler:
                 # Prepare data for batch insert/update
                 user_data = [(user['user_id'], user['name']) for user in users]
                 
-                # Upsert query
-                query = """
-                    INSERT INTO zkt_users (user_id, username)
-                    VALUES (%s, %s)
-                    ON CONFLICT (user_id) 
-                    DO UPDATE SET username = EXCLUDED.username
-                """
+                # Insert or update based on user_id
+                for user_id, username in user_data:
+                    cur.execute("""
+                        WITH upsert AS (
+                            UPDATE zkt_users 
+                            SET username = %s,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                            RETURNING *
+                        )
+                        INSERT INTO zkt_users (user_id, username, created_at, updated_at)
+                        SELECT %s, %s, NOW(), NOW()
+                        WHERE NOT EXISTS (SELECT * FROM upsert)
+                    """, (username, user_id, user_id, username))
                 
-                execute_batch(cur, query, user_data)
                 self.conn.commit()
                 self.logger.info(f"Successfully synced {len(users)} users")
                 return True
@@ -94,7 +99,8 @@ class DatabaseHandler:
         """Get the latest attendance timestamp"""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT MAX(timestamp) FROM zkt_attendance")
+                # Modified to handle string timestamp
+                cur.execute("SELECT MAX(CAST(timestamp AS timestamp)) FROM zkt_attendance")
                 return cur.fetchone()[0]
         except Exception as e:
             self.logger.error(f"Error getting latest timestamp: {str(e)}")
@@ -108,6 +114,19 @@ class DatabaseHandler:
                 return cur.fetchone()[0]
         except Exception as e:
             self.logger.error(f"Error getting attendance count: {str(e)}")
+            return 0
+
+    def get_attendance_count_by_device(self, device_serial):
+        """Get total number of attendance records for specific device"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) FROM zkt_attendance 
+                    WHERE device_serial = %s
+                """, (device_serial,))
+                return cur.fetchone()[0]
+        except Exception as e:
+            self.logger.error(f"Error getting attendance count for device {device_serial}: {str(e)}")
             return 0
 
     def clear_attendance_table(self):
@@ -126,58 +145,85 @@ class DatabaseHandler:
     def save_attendance(self, records, device_serial):
         """Save attendance records to database"""
         try:
-            with self.conn.cursor() as cur:
-                success_count = 0
-                for record in records:
-                    # Simple insert without checking for duplicates
-                    insert_query = """
-                        INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
-                        VALUES (%s, %s, %s)
-                    """
-                    cur.execute(insert_query, (record['user_id'], record['timestamp'], device_serial))
-                    success_count += 1
-                    
-                    # Debug logging
-                    self.logger.debug(
-                        f"Processed record - User: {record['user_id']}, "
-                        f"Time: {record['timestamp']}, Device: {device_serial}"
-                    )
+            # Try to save users if they exist
+            unique_users = list({
+                record['user_id']: {
+                    'user_id': record['user_id'],
+                    'name': f"User {record['user_id']}"
+                }
+                for record in records
+            }.values())
 
+            try:
+                self.sync_users(unique_users)
+            except Exception as e:
+                self.logger.warning(f"Could not sync users, continuing anyway: {str(e)}")
+
+            # Save attendance records in batches
+            with self.conn.cursor() as cur:
+                batch_size = 100
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    for record in batch:
+                        cur.execute("""
+                            INSERT INTO zkt_attendance 
+                            (user_id, timestamp, device_serial, status, created_at)
+                            SELECT %s, %s, %s, %s, NOW()
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM zkt_attendance 
+                                WHERE user_id = %s 
+                                AND timestamp = %s 
+                                AND device_serial = %s
+                            )
+                        """, (
+                            record['user_id'],            # INSERT user_id
+                            str(record['timestamp']),     # INSERT timestamp
+                            device_serial,                # INSERT device_serial
+                            'PENDING',                    # INSERT status
+                            record['user_id'],            # WHERE user_id
+                            str(record['timestamp']),     # WHERE timestamp
+                            device_serial                 # WHERE device_serial
+                        ))
+                    
                 self.conn.commit()
-                if success_count > 0:
-                    self.logger.info(f"Successfully saved {success_count} new attendance records")
-                return success_count > 0
+                self.logger.info(f"Saved {len(records)} attendance records")
+                return True
+                
         except Exception as e:
             self.logger.error(f"Error saving attendance: {str(e)}")
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             return False
 
     def sync_device_records(self, records, device_serial):
         """Full sync of device records"""
         try:
-            # First get count before sync
-            old_count = self.get_attendance_count()
+            old_count = self.get_attendance_count_by_device(device_serial)
             
-            # Clear and reinsert all records for this device
             with self.conn.cursor() as cur:
                 cur.execute("DELETE FROM zkt_attendance WHERE device_serial = %s", (device_serial,))
                 
                 # Batch insert all records
-                attendance_data = [
-                    (record['user_id'], record['timestamp'], device_serial)
-                    for record in records
-                ]
-                
-                execute_batch(cur, """
-                    INSERT INTO zkt_attendance (user_id, timestamp, device_serial)
-                    VALUES (%s, %s, %s)
-                """, attendance_data)
+                batch_size = 100
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    for record in batch:
+                        cur.execute("""
+                            INSERT INTO zkt_attendance 
+                            (user_id, timestamp, device_serial, status, created_at)
+                            VALUES (%s, %s, %s, %s, NOW())
+                        """, (
+                            record['user_id'],
+                            str(record['timestamp']),
+                            device_serial,
+                            'PENDING'
+                        ))
                 
                 self.conn.commit()
-                new_count = self.get_attendance_count()
-                self.logger.info(f"Full sync completed. Records: {old_count} -> {new_count}")
+                new_count = self.get_attendance_count_by_device(device_serial)
+                self.logger.info(f"Full sync completed for device {device_serial}. Records: {old_count} -> {new_count}")
                 return True
         except Exception as e:
-            self.logger.error(f"Error during full sync: {str(e)}")
+            self.logger.error(f"Error during full sync for device {device_serial}: {str(e)}")
             self.conn.rollback()
             return False

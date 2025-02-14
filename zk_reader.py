@@ -86,15 +86,6 @@ class ZKTecoReader:
             self.logger.error(f"Error getting users: {str(e)}")
             return []
 
-    def print_users(self):
-        """Print detailed user information"""
-        users = self.get_users()
-        self.logger.info("=== User Details ===")
-        for user in users:
-            self.logger.info(pformat(user))
-        self.logger.info("==================")
-        return users
-
     def clear_attendance(self):
         """Clear attendance records from device"""
         try:
@@ -175,14 +166,7 @@ class ZKTecoReader:
         try:
             if not self.conn:
                 raise Exception("Device not connected")
-            
-            # For ZKTeco devices that don't support get_device_info
-            # we'll return a dict with basic information
-            return {
-                'ip': self.ip,
-                'serial': self.ip,  # Using IP as serial number
-                'model': 'Unknown'
-            }
+            return self.conn.get_serialnumber()
         except Exception as e:
             self.logger.error(f"Error getting device info: {str(e)}")
             return None
@@ -194,7 +178,7 @@ class ZKTecoReader:
                 raise Exception("Device not connected")
 
             device_info = self.get_device_info()
-            device_serial = device_info['serial'] if device_info else self.ip
+            device_serial = device_info if device_info else self.ip
             
             print(f"\nMonitoring device: {self.ip} (Serial: {device_serial})")
             
@@ -211,15 +195,15 @@ class ZKTecoReader:
                 if current_records:
                     # Check for full sync every 30 minutes
                     if (datetime.now() - last_full_sync).seconds >= SYNC_INTERVAL:
-                        db_count = db_handler.get_attendance_count()
+                        db_count = db_handler.get_attendance_count_by_device(device_serial)
                         device_count = len(current_records)
                         
-                        self.logger.info(f"Periodic check - DB records: {db_count}, Device records: {device_count}")
+                        self.logger.info(f"Periodic check for device {device_serial} - DB records: {db_count}, Device records: {device_count}")
                         
-                        if db_count < device_count:
-                            self.logger.info(f"Database missing records. Performing full sync...")
+                        if db_count != device_count:
+                            self.logger.info(f"Database count mismatch for device {device_serial}. Performing full sync...")
                             if db_handler.sync_device_records(current_records, device_serial):
-                                self.logger.info("Full sync completed successfully")
+                                self.logger.info(f"Full sync completed successfully for device {device_serial}")
                         
                         last_full_sync = datetime.now()
                     
@@ -240,6 +224,48 @@ class ZKTecoReader:
         except Exception as e:
             self.logger.error(f"Error monitoring attendance: {str(e)}")
 
+    def monitor_live_capture_with_db(self, db_handler):
+        """Monitor live capture events and store in database"""
+        try:
+            if not self.conn:
+                raise Exception("Device not connected")
+
+            device_info = self.get_device_info()
+            device_serial = device_info if device_info else self.ip
+            
+            print(f"\nMonitoring live events from device: {self.ip} (Serial: {device_serial})")
+            
+            # Initial sync of users
+            users = self.get_users()
+            db_handler.sync_users(users)
+
+            # Enable real-time monitoring
+            self.conn.enable_device()
+            self.conn.cancel_capture()
+            self.conn.verify_user()
+            self.end_live_capture = False
+            
+            for event in self.conn.live_capture():
+                if event is None:  # timeout
+                    continue
+                if self.end_live_capture:
+                    break
+                    
+                # Convert event to record format
+                record = {
+                    'user_id': event.user_id,
+                    'timestamp': event.timestamp
+                }
+                
+                # Save to database
+                if db_handler.save_attendance([record], device_serial):
+                    print(f"\nLive event: User {record['user_id']} at {record['timestamp']}")
+                
+        except Exception as e:
+            self.logger.error(f"Error monitoring live events: {str(e)}")
+        finally:
+            self.end_live_capture = True
+
 def main():
     # Initialize database
     db_handler = DatabaseHandler()
@@ -248,13 +274,6 @@ def main():
         return
 
     try:
-        # Ensure database tables exist
-        if not db_handler.ensure_tables():
-            print("Failed to create database tables")
-            return
-            
-        print("Database tables verified successfully")
-
         readers = []
         # Initialize all devices
         for device in DEVICES:
@@ -266,21 +285,38 @@ def main():
             print("No devices connected!")
             return
 
-        # Initial sync of attendance data
-        print("Performing initial sync of attendance data...")
+        # First sync all users from all devices
+        print("Performing initial sync of users from all devices...")
+        all_users = {}
         for reader in readers:
             device_info = reader.get_device_info()
-            device_serial = device_info['serial'] if device_info else reader.ip
+            print(f"Getting users from device: {device_info}")
+            users = reader.get_users()
+            for user in users:
+                all_users[user['user_id']] = user
+
+        # Sync combined users to database
+        if all_users:
+            print(f"Syncing {len(all_users)} users to database...")
+            db_handler.sync_users(list(all_users.values()))
+
+        # Now start attendance sync
+        print("\nStarting attendance sync...")
+        for reader in readers:
+            device_info = reader.get_device_info()
+            print(f"Device: {device_info}")
+            device_serial = device_info if device_info else reader.ip
             logs = reader.get_attendance_logs()
             if logs:
                 db_handler.save_attendance(logs, device_serial)
 
-        # Monitor all devices
+        # Start live monitoring on all devices
+        print("\nStarting live monitoring on all devices...")
         import threading
         threads = []
         for reader in readers:
             thread = threading.Thread(
-                target=reader.monitor_attendance_with_db,
+                target=reader.monitor_live_capture_with_db,
                 args=(db_handler,)
             )
             thread.daemon = True
@@ -293,7 +329,11 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopping monitoring...")
+        # Signal all threads to stop
+        for reader in readers:
+            reader.end_live_capture = True
     finally:
+        # Clean up
         for reader in readers:
             reader.disconnect()
         db_handler.disconnect()
