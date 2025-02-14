@@ -335,7 +335,7 @@ def main():
     finally:
         # Clean up
         for reader in readers:
-            reader.disconnect()
+            reader.conn.disconnect()
         db_handler.disconnect()
 
 if __name__ == "__main__":
